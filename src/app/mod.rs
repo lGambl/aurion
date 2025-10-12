@@ -1,13 +1,18 @@
 pub mod audio;
 
 use std::{
+    collections::VecDeque,
+    f32::consts::PI,
+    mem::size_of,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use self::audio::AudioCapture;
 use anyhow::{Context, Result};
+use bytemuck::{Pod, Zeroable};
 use crossbeam::queue::ArrayQueue;
+use rustfft::{num_complex::Complex32, FftPlanner};
 use wgpu::SurfaceError;
 use winit::{
     application::ApplicationHandler,
@@ -22,6 +27,11 @@ const AUDIO_ATTACK: f32 = 0.2;
 const AUDIO_DECAY: f32 = 0.96;
 const MIN_LEVEL_DB: f32 = -90.0;
 const MIN_AUDIO_LEVEL: f32 = 1.0e-6;
+const FFT_SIZE: usize = 2_048;
+const MAX_AUDIO_SAMPLES: usize = FFT_SIZE * 4;
+const SPECTRUM_BINS: usize = 96;
+const SPECTRUM_ATTACK: f32 = 0.25;
+const SPECTRUM_DECAY: f32 = 0.85;
 
 pub struct AurionApp {
     window: Option<Arc<Window>>,
@@ -89,7 +99,7 @@ impl ApplicationHandler for AurionApp {
                 state.resize(new_size);
             }
             WindowEvent::RedrawRequested => {
-                state.update_audio_meter();
+                state.update_audio_state();
                 state.update_window_title(window);
                 match state.render_frame() {
                     Ok(()) => {}
@@ -131,6 +141,199 @@ struct RendererState {
     _audio: AudioCapture,
     audio_queue: Arc<ArrayQueue<f32>>,
     audio_level: f32,
+    audio_history: VecDeque<f32>,
+    fft_buffer: Vec<Complex32>,
+    fft: Arc<dyn rustfft::Fft<f32> + Send + Sync>,
+    fft_window: Vec<f32>,
+    spectrum_bins: Vec<f32>,
+    spectrum_renderer: SpectrumRenderer,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct Vertex {
+    position: [f32; 2],
+    color: [f32; 3],
+}
+
+impl Vertex {
+    const ATTRIBUTES: [wgpu::VertexAttribute; 2] =
+        wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x3];
+
+    fn layout() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: size_of::<Vertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &Self::ATTRIBUTES,
+        }
+    }
+}
+
+struct SpectrumRenderer {
+    pipeline: wgpu::RenderPipeline,
+    vertex_buffer: wgpu::Buffer,
+    cpu_vertices: Vec<Vertex>,
+    vertex_capacity: usize,
+    vertex_count: u32,
+}
+
+impl SpectrumRenderer {
+    fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Aurion Spectrum Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/spectrum.wgsl").into()),
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Aurion Spectrum Pipeline Layout"),
+            bind_group_layouts: &[],
+            push_constant_ranges: &[],
+        });
+
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Aurion Spectrum Pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[Vertex::layout()],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        let vertex_capacity = SPECTRUM_BINS * 6;
+        let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Aurion Spectrum Vertex Buffer"),
+            size: (vertex_capacity * size_of::<Vertex>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        Self {
+            pipeline,
+            vertex_buffer,
+            cpu_vertices: Vec::with_capacity(vertex_capacity),
+            vertex_capacity,
+            vertex_count: 0,
+        }
+    }
+
+    fn update(&mut self, queue: &wgpu::Queue, levels: &[f32]) {
+        self.cpu_vertices.clear();
+
+        if levels.is_empty() {
+            self.vertex_count = 0;
+            return;
+        }
+
+        let bar_width = 2.0f32 / levels.len() as f32;
+        let gap = bar_width * 0.2;
+        let base_line = -0.95f32;
+        let max_height = 1.9f32;
+
+        for (index, &level) in levels.iter().enumerate() {
+            let clamped = level.clamp(0.0, 1.0);
+            let x0 = -1.0 + index as f32 * bar_width + gap * 0.5;
+            let x1 = x0 + bar_width - gap;
+            let y0 = base_line;
+            let y1 = (y0 + clamped * max_height).clamp(-1.0, 1.0);
+
+            let bottom_color = color_for_level(clamped * 0.4);
+            let top_color = color_for_level(clamped);
+
+            self.cpu_vertices.extend_from_slice(&[
+                Vertex {
+                    position: [x0, y0],
+                    color: bottom_color,
+                },
+                Vertex {
+                    position: [x1, y0],
+                    color: bottom_color,
+                },
+                Vertex {
+                    position: [x1, y1],
+                    color: top_color,
+                },
+                Vertex {
+                    position: [x0, y0],
+                    color: bottom_color,
+                },
+                Vertex {
+                    position: [x1, y1],
+                    color: top_color,
+                },
+                Vertex {
+                    position: [x0, y1],
+                    color: top_color,
+                },
+            ]);
+        }
+
+        debug_assert!(self.cpu_vertices.len() <= self.vertex_capacity);
+
+        if self.cpu_vertices.is_empty() {
+            self.vertex_count = 0;
+            return;
+        }
+
+        queue.write_buffer(
+            &self.vertex_buffer,
+            0,
+            bytemuck::cast_slice(&self.cpu_vertices),
+        );
+        self.vertex_count = self.cpu_vertices.len() as u32;
+    }
+
+    fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
+        if self.vertex_count == 0 {
+            return;
+        }
+        pass.set_pipeline(&self.pipeline);
+        pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+        pass.draw(0..self.vertex_count, 0..1);
+    }
+}
+
+fn color_for_level(level: f32) -> [f32; 3] {
+    let l = level.clamp(0.0, 1.0);
+    if l <= 0.5 {
+        let t = l / 0.5;
+        lerp_color([0.08, 0.1, 0.4], [0.12, 0.75, 0.95], t)
+    } else {
+        let t = (l - 0.5) / 0.5;
+        lerp_color([0.12, 0.75, 0.95], [1.0, 0.78, 0.2], t)
+    }
+}
+
+fn lerp_color(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
+    [lerp(a[0], b[0], t), lerp(a[1], b[1], t), lerp(a[2], b[2], t)]
+}
+
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
 }
 
 impl RendererState {
@@ -201,6 +404,19 @@ impl RendererState {
         let audio = AudioCapture::new().context("failed to start audio capture")?;
         let audio_queue = audio.queue();
 
+        let mut fft_planner = FftPlanner::new();
+        let fft = fft_planner.plan_fft_forward(FFT_SIZE);
+        let fft_buffer = vec![Complex32::new(0.0, 0.0); FFT_SIZE];
+        let fft_window = (0..FFT_SIZE)
+            .map(|i| {
+                let position = i as f32 / (FFT_SIZE - 1) as f32;
+                0.5 - 0.5 * (2.0 * PI * position).cos()
+            })
+            .collect();
+        let audio_history = VecDeque::with_capacity(MAX_AUDIO_SAMPLES);
+        let spectrum_bins = vec![0.0; SPECTRUM_BINS];
+        let spectrum_renderer = SpectrumRenderer::new(&device, config.format);
+
         Ok(Self {
             surface,
             device,
@@ -214,6 +430,12 @@ impl RendererState {
             _audio: audio,
             audio_queue,
             audio_level: 0.0,
+            audio_history,
+            fft_buffer,
+            fft,
+            fft_window,
+            spectrum_bins,
+            spectrum_renderer,
         })
     }
 
@@ -239,8 +461,8 @@ impl RendererState {
             });
 
         {
-            let _ = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Aurion Clear Pass"),
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Aurion Spectrum Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     depth_slice: None,
@@ -259,6 +481,7 @@ impl RendererState {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
+            self.spectrum_renderer.draw(&mut pass);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -267,26 +490,79 @@ impl RendererState {
         Ok(())
     }
 
-    fn update_audio_meter(&mut self) {
-        let mut sum = 0.0;
-        let mut count = 0;
+    fn update_audio_state(&mut self) {
+        let mut meter_sum = 0.0;
+        let mut meter_count = 0;
+        let mut popped = 0usize;
 
-        while count < METER_SAMPLES_PER_FRAME {
-            match self.audio_queue.pop() {
-                Some(sample) => {
-                    sum += sample * sample;
-                    count += 1;
-                }
-                None => break,
+        while let Some(sample) = self.audio_queue.pop() {
+            self.audio_history.push_back(sample);
+            if self.audio_history.len() > MAX_AUDIO_SAMPLES {
+                self.audio_history.pop_front();
             }
+
+            if popped < METER_SAMPLES_PER_FRAME {
+                meter_sum += sample * sample;
+                meter_count += 1;
+            }
+            popped += 1;
         }
 
-        if count > 0 {
-            let rms = (sum / count as f32).sqrt();
+        if meter_count > 0 {
+            let rms = (meter_sum / meter_count as f32).sqrt();
             self.audio_level = self.audio_level * (1.0 - AUDIO_ATTACK) + rms * AUDIO_ATTACK;
         } else {
             self.audio_level *= AUDIO_DECAY;
         }
+
+        if self.audio_history.len() >= FFT_SIZE {
+            let start_index = self.audio_history.len() - FFT_SIZE;
+            for (i, sample) in self
+                .audio_history
+                .iter()
+                .skip(start_index)
+                .enumerate()
+            {
+                let windowed = *sample * self.fft_window[i];
+                self.fft_buffer[i] = Complex32::new(windowed, 0.0);
+            }
+
+            self.fft.process(&mut self.fft_buffer);
+
+            let half_len = FFT_SIZE / 2;
+            let bins = SPECTRUM_BINS.min(half_len.max(1));
+            for bin in 0..bins {
+                let start = (bin * half_len) / bins;
+                let end = ((bin + 1) * half_len) / bins;
+                let mut max_power = 0.0;
+                for freq in start..end.max(start + 1) {
+                    let power = self.fft_buffer[freq].norm_sqr();
+                    if power > max_power {
+                        max_power = power;
+                    }
+                }
+
+                let amplitude = (max_power / FFT_SIZE as f32).sqrt();
+                let current = self.spectrum_bins[bin];
+                let updated = if amplitude > current {
+                    current + (amplitude - current) * SPECTRUM_ATTACK
+                } else {
+                    current * SPECTRUM_DECAY + amplitude * (1.0 - SPECTRUM_DECAY)
+                };
+                self.spectrum_bins[bin] = updated.clamp(0.0, 1.0);
+            }
+
+            for level in self.spectrum_bins.iter_mut().skip(bins) {
+                *level *= SPECTRUM_DECAY;
+            }
+        } else {
+            for level in &mut self.spectrum_bins {
+                *level *= SPECTRUM_DECAY;
+            }
+        }
+
+        self.spectrum_renderer
+            .update(&self.queue, &self.spectrum_bins);
     }
 
     fn update_window_title(&mut self, window: &Window) {
