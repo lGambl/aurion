@@ -19,7 +19,8 @@ use winit::{
     dpi::PhysicalSize,
     event::WindowEvent,
     event_loop::{ActiveEventLoop, EventLoop},
-    window::{Window, WindowAttributes, WindowId},
+    keyboard::{Key, NamedKey},
+    window::{Window, WindowAttributes, WindowId, WindowLevel},
 };
 
 const METER_SAMPLES_PER_FRAME: usize = 4_096;
@@ -29,14 +30,21 @@ const MIN_LEVEL_DB: f32 = -90.0;
 const MIN_AUDIO_LEVEL: f32 = 1.0e-6;
 const FFT_SIZE: usize = 2_048;
 const MAX_AUDIO_SAMPLES: usize = FFT_SIZE * 4;
-const SPECTRUM_BINS: usize = 96;
+const INITIAL_SPECTRUM_BINS: usize = 256;
 const SPECTRUM_ATTACK: f32 = 0.25;
 const SPECTRUM_DECAY: f32 = 0.85;
+// Visual tuning defaults (now adjustable at runtime)
+const DEFAULT_GAP_FRACTION: f32 = 0.01; // 1% of each bar width is gap
+const DEFAULT_GAIN: f32 = 1.6; // vertical gain before clamping
+const DEFAULT_SIDE_FRACTION: f32 = 0.25; // each side uses up to 25% width
+const DEFAULT_WIDTH_SCALE: f32 = 1.2; // expand bar width within its cell
 
 pub struct AurionApp {
     window: Option<Arc<Window>>,
     window_id: Option<WindowId>,
     state: Option<RendererState>,
+    click_through: bool,
+    always_on_top: bool,
 }
 
 impl Default for AurionApp {
@@ -45,6 +53,8 @@ impl Default for AurionApp {
             window: None,
             window_id: None,
             state: None,
+            click_through: false,
+            always_on_top: true,
         }
     }
 }
@@ -57,7 +67,10 @@ impl ApplicationHandler for AurionApp {
 
         let attrs: WindowAttributes = Window::default_attributes()
             .with_title("Aurion (starting)")
-            .with_inner_size(PhysicalSize::new(1280, 720));
+            .with_inner_size(PhysicalSize::new(1280, 720))
+            .with_transparent(true)
+            .with_decorations(true)
+            .with_window_level(WindowLevel::AlwaysOnTop);
 
         let raw_window = event_loop
             .create_window(attrs)
@@ -65,8 +78,14 @@ impl ApplicationHandler for AurionApp {
         let window_id = raw_window.id();
         let window = Arc::new(raw_window);
 
+        // Enable click-through by default (toggle with F8)
+        if self.click_through {
+            window.set_cursor_hittest(false);
+        }
+
         let state = pollster::block_on(RendererState::new(Arc::clone(&window)))
             .expect("failed to initialize GPU/audio state");
+
 
         self.state = Some(state);
         self.window_id = Some(window_id);
@@ -89,6 +108,115 @@ impl ApplicationHandler for AurionApp {
 
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::KeyboardInput { event, .. } => {
+                // Toggle click-through with F8, close with Escape
+                if event.state == winit::event::ElementState::Pressed {
+                    match &event.logical_key {
+                        Key::Named(NamedKey::F8) => {
+                            self.click_through = !self.click_through;
+                            window.set_cursor_hittest(!self.click_through);
+                        }
+                        Key::Named(NamedKey::F7) => {
+                            // Toggle always-on-top
+                            self.always_on_top = !self.always_on_top;
+                            use winit::window::WindowLevel as WL;
+                            let next = if self.always_on_top { WL::AlwaysOnTop } else { WL::Normal };
+                            window.set_window_level(next);
+                        }
+                        Key::Named(NamedKey::F9) => {
+                            // Increase number of bars
+                            if let Some(state) = self.state.as_mut() {
+                                let half_len = FFT_SIZE / 2;
+                                let max_bins = half_len.max(1);
+                                let step = 16usize;
+                                let new_bins = (state.num_bins + step).min(max_bins);
+                                if new_bins != state.num_bins {
+                                    state.num_bins = new_bins;
+                                    state.spectrum_bins.resize(new_bins, 0.0);
+                                    state.spectrum_renderer = SpectrumRenderer::new(
+                                        &state.device,
+                                        state.config.format,
+                                        new_bins,
+                                        state.blend,
+                                    );
+                                }
+                            }
+                        }
+                        Key::Named(NamedKey::F10) => {
+                            // Decrease number of bars
+                            if let Some(state) = self.state.as_mut() {
+                                let min_bins = 16usize;
+                                let step = 16usize;
+                                let new_bins = state.num_bins.saturating_sub(step).max(min_bins);
+                                if new_bins != state.num_bins {
+                                    state.num_bins = new_bins;
+                                    state.spectrum_bins.resize(new_bins, 0.0);
+                                    state.spectrum_renderer = SpectrumRenderer::new(
+                                        &state.device,
+                                        state.config.format,
+                                        new_bins,
+                                        state.blend,
+                                    );
+                                }
+                            }
+                        }
+                        Key::Named(NamedKey::ArrowUp) => {
+                            if let Some(state) = self.state.as_mut() {
+                                state.gain = (state.gain + 0.1).clamp(0.1, 5.0);
+                            }
+                        }
+                        Key::Named(NamedKey::ArrowDown) => {
+                            if let Some(state) = self.state.as_mut() {
+                                state.gain = (state.gain - 0.1).clamp(0.1, 5.0);
+                            }
+                        }
+                        Key::Named(NamedKey::ArrowRight) => {
+                            if let Some(state) = self.state.as_mut() {
+                                state.gap_fraction = (state.gap_fraction + 0.01).clamp(0.0, 0.4);
+                            }
+                        }
+                        Key::Named(NamedKey::ArrowLeft) => {
+                            if let Some(state) = self.state.as_mut() {
+                                state.gap_fraction = (state.gap_fraction - 0.01).clamp(0.0, 0.4);
+                            }
+                        }
+                        Key::Character(ch) if ch == "r" || ch == "R" => {
+                            if let Some(state) = self.state.as_mut() {
+                                state.gap_fraction = DEFAULT_GAP_FRACTION;
+                                state.gain = DEFAULT_GAIN;
+                                state.side_fraction = DEFAULT_SIDE_FRACTION;
+                                state.width_scale = DEFAULT_WIDTH_SCALE;
+                            }
+                        }
+                        Key::Named(NamedKey::F11) => {
+                            // Increase side coverage up to 50%
+                            if let Some(state) = self.state.as_mut() {
+                                state.side_fraction = (state.side_fraction + 0.05).clamp(0.05, 0.5);
+                            }
+                        }
+                        Key::Named(NamedKey::F12) => {
+                            // Decrease side coverage down to 5%
+                            if let Some(state) = self.state.as_mut() {
+                                state.side_fraction = (state.side_fraction - 0.05).clamp(0.05, 0.5);
+                            }
+                        }
+                        Key::Character(ch) if ch == "]" => {
+                            if let Some(state) = self.state.as_mut() {
+                                state.width_scale = (state.width_scale + 0.05).clamp(0.1, 2.0);
+                            }
+                        }
+                        Key::Character(ch) if ch == "[" => {
+                            if let Some(state) = self.state.as_mut() {
+                                state.width_scale = (state.width_scale - 0.05).clamp(0.1, 2.0);
+                            }
+                        }
+                        Key::Named(NamedKey::Escape) => {
+                            event_loop.exit();
+                        }
+                        _ => {}
+                    }
+                }
+            }
             WindowEvent::Resized(size) => state.resize(size),
             WindowEvent::ScaleFactorChanged {
                 mut inner_size_writer,
@@ -147,6 +275,12 @@ struct RendererState {
     fft_window: Vec<f32>,
     spectrum_bins: Vec<f32>,
     spectrum_renderer: SpectrumRenderer,
+    num_bins: usize,
+    gap_fraction: f32,
+    gain: f32,
+    side_fraction: f32,
+    width_scale: f32,
+    blend: wgpu::BlendState,
 }
 
 #[repr(C)]
@@ -178,7 +312,12 @@ struct SpectrumRenderer {
 }
 
 impl SpectrumRenderer {
-    fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+    fn new(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        bins: usize,
+        blend: wgpu::BlendState,
+    ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Aurion Spectrum Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/spectrum.wgsl").into()),
@@ -205,7 +344,7 @@ impl SpectrumRenderer {
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    blend: Some(blend),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
@@ -224,7 +363,7 @@ impl SpectrumRenderer {
             cache: None,
         });
 
-        let vertex_capacity = SPECTRUM_BINS * 6;
+        let vertex_capacity = bins.max(1) * 6;
         let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Aurion Spectrum Vertex Buffer"),
             size: (vertex_capacity * size_of::<Vertex>()) as u64,
@@ -241,7 +380,7 @@ impl SpectrumRenderer {
         }
     }
 
-    fn update(&mut self, queue: &wgpu::Queue, levels: &[f32]) {
+    fn update(&mut self, queue: &wgpu::Queue, levels: &[f32], gap_fraction: f32, gain: f32, side_fraction: f32, width_scale: f32) {
         self.cpu_vertices.clear();
 
         if levels.is_empty() {
@@ -249,47 +388,75 @@ impl SpectrumRenderer {
             return;
         }
 
-        let bar_width = 2.0f32 / levels.len() as f32;
-        let gap = bar_width * 0.2;
-        let base_line = -0.95f32;
-        let max_height = 1.9f32;
+        let base_line = -1.0f32; // bottom of NDC
+        let max_height = 2.0f32; // full vertical range
+        let side = side_fraction.clamp(0.0, 0.5);
+        let total = levels.len();
+        let left_count = total / 2;
+        let right_count = total - left_count;
 
-        for (index, &level) in levels.iter().enumerate() {
-            let clamped = level.clamp(0.0, 1.0);
-            let x0 = -1.0 + index as f32 * bar_width + gap * 0.5;
-            let x1 = x0 + bar_width - gap;
-            let y0 = base_line;
-            let y1 = (y0 + clamped * max_height).clamp(-1.0, 1.0);
+        // Left band occupies left side_fraction of width
+        if left_count > 0 && side > 0.0 {
+            let left_x0 = -1.0f32;
+            let left_x1 = -1.0f32 + 2.0f32 * side;
+            let band_width = left_x1 - left_x0;
+            let cell_width = band_width / left_count as f32;
+            let gap = cell_width * gap_fraction.clamp(0.0, 0.9);
+            for i in 0..left_count {
+                let level = levels[i];
+                let clamped = (level * gain).clamp(0.0, 1.0);
+                let center = left_x0 + (i as f32 + 0.5) * cell_width;
+                let mut bar_w = (cell_width - gap) * width_scale.max(0.1);
+                if bar_w > cell_width { bar_w = cell_width; }
+                let x0 = center - bar_w * 0.5;
+                let x1 = center + bar_w * 0.5;
+                let y0 = base_line;
+                let y1 = (y0 + clamped * max_height).clamp(-1.0, 1.0);
 
-            let bottom_color = color_for_level(clamped * 0.4);
-            let top_color = color_for_level(clamped);
+                let bottom_color = color_for_level(clamped * 0.4);
+                let top_color = color_for_level(clamped);
 
-            self.cpu_vertices.extend_from_slice(&[
-                Vertex {
-                    position: [x0, y0],
-                    color: bottom_color,
-                },
-                Vertex {
-                    position: [x1, y0],
-                    color: bottom_color,
-                },
-                Vertex {
-                    position: [x1, y1],
-                    color: top_color,
-                },
-                Vertex {
-                    position: [x0, y0],
-                    color: bottom_color,
-                },
-                Vertex {
-                    position: [x1, y1],
-                    color: top_color,
-                },
-                Vertex {
-                    position: [x0, y1],
-                    color: top_color,
-                },
-            ]);
+                self.cpu_vertices.extend_from_slice(&[
+                    Vertex { position: [x0, y0], color: bottom_color },
+                    Vertex { position: [x1, y0], color: bottom_color },
+                    Vertex { position: [x1, y1], color: top_color },
+                    Vertex { position: [x0, y0], color: bottom_color },
+                    Vertex { position: [x1, y1], color: top_color },
+                    Vertex { position: [x0, y1], color: top_color },
+                ]);
+            }
+        }
+
+        // Right band occupies right side_fraction of width
+        if right_count > 0 && side > 0.0 {
+            let right_x0 = 1.0f32 - 2.0f32 * side;
+            let right_x1 = 1.0f32;
+            let band_width = right_x1 - right_x0;
+            let cell_width = band_width / right_count as f32;
+            let gap = cell_width * gap_fraction.clamp(0.0, 0.9);
+            for j in 0..right_count {
+                let level = levels[left_count + j];
+                let clamped = (level * gain).clamp(0.0, 1.0);
+                let center = right_x0 + (j as f32 + 0.5) * cell_width;
+                let mut bar_w = (cell_width - gap) * width_scale.max(0.1);
+                if bar_w > cell_width { bar_w = cell_width; }
+                let x0 = center - bar_w * 0.5;
+                let x1 = center + bar_w * 0.5;
+                let y0 = base_line;
+                let y1 = (y0 + clamped * max_height).clamp(-1.0, 1.0);
+
+                let bottom_color = color_for_level(clamped * 0.4);
+                let top_color = color_for_level(clamped);
+
+                self.cpu_vertices.extend_from_slice(&[
+                    Vertex { position: [x0, y0], color: bottom_color },
+                    Vertex { position: [x1, y0], color: bottom_color },
+                    Vertex { position: [x1, y1], color: top_color },
+                    Vertex { position: [x0, y0], color: bottom_color },
+                    Vertex { position: [x1, y1], color: top_color },
+                    Vertex { position: [x0, y1], color: top_color },
+                ]);
+            }
         }
 
         debug_assert!(self.cpu_vertices.len() <= self.vertex_capacity);
@@ -340,7 +507,10 @@ impl RendererState {
     async fn new(window: Arc<Window>) -> Result<Self> {
         let size = window.inner_size();
 
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN,
+            ..Default::default()
+        });
         let surface = instance
             .create_surface(Arc::clone(&window))
             .context("failed to create surface")?;
@@ -366,6 +536,15 @@ impl RendererState {
             .context("failed to create device")?;
 
         let surface_caps = surface.get_capabilities(&adapter);
+
+        // Optional debug of surface capabilities
+        eprintln!(
+            "formats: {:?}\npresent_modes: {:?}\nalpha_modes: {:?}",
+            surface_caps.formats,
+            surface_caps.present_modes,
+            surface_caps.alpha_modes
+        );
+
         let surface_format = surface_caps
             .formats
             .iter()
@@ -382,11 +561,32 @@ impl RendererState {
             surface_caps.present_modes[0]
         };
 
-        let alpha_mode = surface_caps
-            .alpha_modes
-            .first()
+        // Prefer transparent compositing when supported
+        let alpha_mode = surface_caps.alpha_modes
+            .iter()
             .copied()
+            .find(|m| *m == wgpu::CompositeAlphaMode::PreMultiplied)
+            .or_else(|| surface_caps.alpha_modes
+                .iter()
+                .copied()
+                .find(|m| *m == wgpu::CompositeAlphaMode::PostMultiplied))
             .unwrap_or(wgpu::CompositeAlphaMode::Opaque);
+
+        // Helpful heads-up if the platform can't do true transparency
+        if alpha_mode == wgpu::CompositeAlphaMode::Opaque {
+            eprintln!(
+                "WARNING: Surface alpha mode is Opaque; real desktop-through transparency \
+                 won't be available on this platform/driver."
+            );
+        }
+
+        // Choose appropriate blending for the selected alpha mode
+        let premul = alpha_mode == wgpu::CompositeAlphaMode::PreMultiplied;
+        let blend = if premul {
+            wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING
+        } else {
+            wgpu::BlendState::ALPHA_BLENDING
+        };
 
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -414,8 +614,8 @@ impl RendererState {
             })
             .collect();
         let audio_history = VecDeque::with_capacity(MAX_AUDIO_SAMPLES);
-        let spectrum_bins = vec![0.0; SPECTRUM_BINS];
-        let spectrum_renderer = SpectrumRenderer::new(&device, config.format);
+        let spectrum_bins = vec![0.0; INITIAL_SPECTRUM_BINS];
+        let spectrum_renderer = SpectrumRenderer::new(&device, config.format, INITIAL_SPECTRUM_BINS, blend);
 
         Ok(Self {
             surface,
@@ -436,6 +636,12 @@ impl RendererState {
             fft_window,
             spectrum_bins,
             spectrum_renderer,
+            num_bins: INITIAL_SPECTRUM_BINS,
+            gap_fraction: DEFAULT_GAP_FRACTION,
+            gain: DEFAULT_GAIN,
+            side_fraction: DEFAULT_SIDE_FRACTION,
+            width_scale: DEFAULT_WIDTH_SCALE,
+            blend,
         })
     }
 
@@ -469,10 +675,10 @@ impl RendererState {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.02,
-                            g: 0.02,
-                            b: 0.06,
-                            a: 1.0,
+                            r: 0.0,
+                            g: 0.0,
+                            b: 0.0,
+                            a: 0.0,
                         }),
                         store: wgpu::StoreOp::Store,
                     },
@@ -530,7 +736,7 @@ impl RendererState {
             self.fft.process(&mut self.fft_buffer);
 
             let half_len = FFT_SIZE / 2;
-            let bins = SPECTRUM_BINS.min(half_len.max(1));
+            let bins = self.num_bins.min(half_len.max(1));
             for bin in 0..bins {
                 let start = (bin * half_len) / bins;
                 let end = ((bin + 1) * half_len) / bins;
@@ -562,7 +768,7 @@ impl RendererState {
         }
 
         self.spectrum_renderer
-            .update(&self.queue, &self.spectrum_bins);
+            .update(&self.queue, &self.spectrum_bins, self.gap_fraction, self.gain, self.side_fraction, self.width_scale);
     }
 
     fn update_window_title(&mut self, window: &Window) {
