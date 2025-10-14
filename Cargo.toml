@@ -14,10 +14,12 @@ rustfft = "6.4.1"
 thiserror = "2.0.17"
 wgpu = "26.0.1"
 winit = "0.30.12"
+raw-window-handle = "0.6"
 
 [features]
 default = []
 wgcapture = ["windows"]
+dcomp = ["windows"]
 
 [dependencies.windows]
 version = "0.56.0"
@@ -26,9 +28,11 @@ features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D_Fxc",
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_DirectComposition",
     "Win32_System_WinRT",
     "Win32_System_WinRT_Graphics",
     "Win32_System_WinRT_Direct3D11",
@@ -39,3 +43,7 @@ features = [
     "Graphics_DirectX_Direct3D11",
     "Foundation",
 ]
+
+[[bin]]
+name = "aurion-dcomp"
+path = "src/bin/dcomp.rs"

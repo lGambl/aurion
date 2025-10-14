@@ -38,9 +38,9 @@ const INITIAL_SPECTRUM_BINS: usize = 256;
 const SPECTRUM_ATTACK: f32 = 0.25;
 const SPECTRUM_DECAY: f32 = 0.85;
 // Visual tuning defaults (now adjustable at runtime)
-const DEFAULT_GAP_FRACTION: f32 = 0.01; // 1% of each bar width is gap
+const DEFAULT_GAP_FRACTION: f32 = 0.1; // 1% of each bar width is gap
 const DEFAULT_GAIN: f32 = 1.6; // vertical gain before clamping
-const DEFAULT_SIDE_FRACTION: f32 = 0.25; // each side uses up to 25% width
+const DEFAULT_SIDE_FRACTION: f32 = 0.40; // each side uses up to 25% width
 const DEFAULT_WIDTH_SCALE: f32 = 1.2; // expand bar width within its cell
 
 pub struct AurionApp {

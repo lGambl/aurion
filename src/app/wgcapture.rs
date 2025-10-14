@@ -1,19 +1,25 @@
 #![cfg(all(windows, feature = "wgcapture"))]
 
 use std::mem::MaybeUninit;
-use windows::core::{HSTRING, Interface};
-use windows::Graphics::Capture::{Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession};
+use windows::Graphics::Capture::{
+    Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession,
+};
 use windows::Graphics::DirectX::Direct3D11::{IDirect3DDevice, IDirect3DSurface};
 use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
-use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_11_0};
+use windows::Win32::Graphics::Direct3D::{
+    D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_11_0,
+};
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::{Common::*, IDXGIDevice};
 use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, HDC, HMONITOR};
-use windows::Win32::System::WinRT::Direct3D11::{CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess};
+use windows::Win32::System::WinRT::Direct3D11::{
+    CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
+};
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
 use windows::Win32::System::WinRT::RoGetActivationFactory;
 use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+use windows::core::{HSTRING, Interface};
 
 #[derive(Clone, Copy, Debug)]
 pub enum Source {
@@ -74,7 +80,11 @@ impl WgcCapture {
             self.monitors = enumerate_monitors();
         }
         if !self.monitors.is_empty() {
-            if self.monitor_index == 0 { self.monitor_index = self.monitors.len() - 1; } else { self.monitor_index -= 1; }
+            if self.monitor_index == 0 {
+                self.monitor_index = self.monitors.len() - 1;
+            } else {
+                self.monitor_index -= 1;
+            }
             self.source = Source::MonitorIndex(self.monitor_index);
             self.restart_capture();
         }
@@ -107,7 +117,10 @@ impl WgcCapture {
             }
         }
 
-        let surface: IDirect3DSurface = match frame.Surface() { Ok(s) => s, Err(_) => return None };
+        let surface: IDirect3DSurface = match frame.Surface() {
+            Ok(s) => s,
+            Err(_) => return None,
+        };
         let tex: ID3D11Texture2D = unsafe {
             let access: IDirect3DDxgiInterfaceAccess = surface.cast().ok()?;
             access.GetInterface().ok()?
@@ -130,15 +143,21 @@ impl WgcCapture {
                 Height: h,
                 MipLevels: 1,
                 ArraySize: 1,
-                Format: src_desc.Format,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
                 Usage: D3D11_USAGE_STAGING,
                 BindFlags: 0,
                 CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
                 MiscFlags: 0,
             };
             let mut staging: Option<ID3D11Texture2D> = None;
-            if device.CreateTexture2D(&staging_desc, None, Some(&mut staging)).is_err() {
+            if device
+                .CreateTexture2D(&staging_desc, None, Some(&mut staging))
+                .is_err()
+            {
                 return None;
             }
             let staging = staging.unwrap();
@@ -148,7 +167,10 @@ impl WgcCapture {
 
             // Map and copy into our buffer
             let mut mapped = MaybeUninit::<D3D11_MAPPED_SUBRESOURCE>::zeroed().assume_init();
-            if ctx.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)).is_err() {
+            if ctx
+                .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                .is_err()
+            {
                 return None;
             }
 
@@ -157,11 +179,22 @@ impl WgcCapture {
             let total = dst_row_pitch * (h as usize);
             self.buffer.resize(total, 0);
             let src_ptr = mapped.pData as *const u8;
+
             for row in 0..(h as usize) {
-                let src = std::slice::from_raw_parts(src_ptr.add(row * src_row_pitch), dst_row_pitch);
-                let dst = &mut self.buffer[row * dst_row_pitch .. (row+1) * dst_row_pitch];
-                dst.copy_from_slice(src);
+                let src =
+                    std::slice::from_raw_parts(src_ptr.add(row * src_row_pitch), src_row_pitch);
+                let dst = &mut self.buffer[row * dst_row_pitch..(row + 1) * dst_row_pitch];
+
+                // Clamp to the smaller of source or destination pitch
+                let len = dst.len().min(src.len());
+                dst[..len].copy_from_slice(&src[..len]);
             }
+
+            // Ensure alpha is fully opaque
+            for px in self.buffer.chunks_mut(4) {
+                px[3] = 0xFF;
+            }
+
             ctx.Unmap(&staging, 0);
         }
 
@@ -176,8 +209,12 @@ impl WgcCapture {
     }
 
     fn stop_capture(&mut self) {
-        if let Some(session) = self.session.take() { let _ = session.Close(); }
-        if let Some(pool) = self.frame_pool.take() { let _ = pool.Close(); }
+        if let Some(session) = self.session.take() {
+            let _ = session.Close();
+        }
+        if let Some(pool) = self.frame_pool.take() {
+            let _ = pool.Close();
+        }
         self.item = None;
     }
 
@@ -188,23 +225,25 @@ impl WgcCapture {
         self.wgc_device = Some(wgc_dev.clone());
 
         let item = match self.source {
-            Source::ForegroundWindow => {
-                unsafe {
-                    let hwnd: HWND = GetForegroundWindow();
-                    if hwnd.0 == 0 { return Ok(()); }
-                    let class_name = HSTRING::from("Windows.Graphics.Capture.GraphicsCaptureItem");
-                    let interop: IGraphicsCaptureItemInterop = RoGetActivationFactory(&class_name)?;
-                    let item: GraphicsCaptureItem = interop.CreateForWindow(hwnd)?;
-                    item
+            Source::ForegroundWindow => unsafe {
+                let hwnd: HWND = GetForegroundWindow();
+                if hwnd.0 == 0 {
+                    return Ok(());
                 }
-            }
+                let class_name = HSTRING::from("Windows.Graphics.Capture.GraphicsCaptureItem");
+                let interop: IGraphicsCaptureItemInterop = RoGetActivationFactory(&class_name)?;
+                let item: GraphicsCaptureItem = interop.CreateForWindow(hwnd)?;
+                item
+            },
             Source::MonitorIndex(i) => {
                 if self.monitors.is_empty() {
                     self.monitors = enumerate_monitors();
                 }
                 let idx = i.min(self.monitors.len().saturating_sub(1));
                 let hmon = self.monitors.get(idx).copied().unwrap_or(HMONITOR(0));
-                if hmon.0 == 0 { return Ok(()); }
+                if hmon.0 == 0 {
+                    return Ok(());
+                }
                 unsafe {
                     let class_name = HSTRING::from("Windows.Graphics.Capture.GraphicsCaptureItem");
                     let interop: IGraphicsCaptureItemInterop = RoGetActivationFactory(&class_name)?;
@@ -236,8 +275,13 @@ impl WgcCapture {
     }
 
     fn resize_pool(&mut self, w: u32, h: u32) {
-        if let (Some(dev), Some(_item), Some(pool)) = (&self.wgc_device, &self.item, &self.frame_pool) {
-            let size = windows::Graphics::SizeInt32 { Width: w as i32, Height: h as i32 };
+        if let (Some(dev), Some(_item), Some(pool)) =
+            (&self.wgc_device, &self.item, &self.frame_pool)
+        {
+            let size = windows::Graphics::SizeInt32 {
+                Width: w as i32,
+                Height: h as i32,
+            };
             let _ = pool.Recreate(dev, DirectXPixelFormat::B8G8R8A8UIntNormalized, 3, size);
             self.size = (w, h);
         }
@@ -245,7 +289,12 @@ impl WgcCapture {
 }
 
 fn enumerate_monitors() -> Vec<HMONITOR> {
-    unsafe extern "system" fn enum_proc(hmon: HMONITOR, _hdc: HDC, _rc: *mut RECT, data: LPARAM) -> BOOL {
+    unsafe extern "system" fn enum_proc(
+        hmon: HMONITOR,
+        _hdc: HDC,
+        _rc: *mut RECT,
+        data: LPARAM,
+    ) -> BOOL {
         let vec = &mut *(data.0 as *mut Vec<HMONITOR>);
         vec.push(hmon);
         BOOL(1)
@@ -258,7 +307,8 @@ fn enumerate_monitors() -> Vec<HMONITOR> {
     monitors
 }
 
-fn create_d3d_devices() -> windows::core::Result<(ID3D11Device, ID3D11DeviceContext, IDirect3DDevice)> {
+fn create_d3d_devices()
+-> windows::core::Result<(ID3D11Device, ID3D11DeviceContext, IDirect3DDevice)> {
     unsafe {
         let mut device: Option<ID3D11Device> = None;
         let mut ctx: Option<ID3D11DeviceContext> = None;
