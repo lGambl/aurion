@@ -1,4 +1,6 @@
 pub mod audio;
+#[cfg(all(windows, feature = "wgcapture"))]
+pub mod wgcapture;
 
 use std::{
     collections::VecDeque,
@@ -22,6 +24,8 @@ use winit::{
     keyboard::{Key, NamedKey},
     window::{Window, WindowAttributes, WindowId, WindowLevel},
 };
+#[cfg(all(windows, feature = "wgcapture"))]
+use crate::app::wgcapture::{Source as WgcSource, WgcCapture};
 
 const METER_SAMPLES_PER_FRAME: usize = 4_096;
 const AUDIO_ATTACK: f32 = 0.2;
@@ -112,6 +116,30 @@ impl ApplicationHandler for AurionApp {
                 // Toggle click-through with F8, close with Escape
                 if event.state == winit::event::ElementState::Pressed {
                     match &event.logical_key {
+                        #[cfg(all(windows, feature = "wgcapture"))]
+                        Key::Named(NamedKey::F1) => {
+                            if let Some(state) = self.state.as_mut() {
+                                state.wgc.set_source(WgcSource::ForegroundWindow);
+                            }
+                        }
+                        #[cfg(all(windows, feature = "wgcapture"))]
+                        Key::Named(NamedKey::F2) => {
+                            if let Some(state) = self.state.as_mut() {
+                                state.wgc.next_monitor();
+                            }
+                        }
+                        #[cfg(all(windows, feature = "wgcapture"))]
+                        Key::Named(NamedKey::F3) => {
+                            if let Some(state) = self.state.as_mut() {
+                                state.wgc.prev_monitor();
+                            }
+                        }
+                        #[cfg(all(windows, feature = "wgcapture"))]
+                        Key::Named(NamedKey::F4) => {
+                            if let Some(state) = self.state.as_mut() {
+                                state.wgc.set_source(WgcSource::None);
+                            }
+                        }
                         Key::Named(NamedKey::F8) => {
                             self.click_through = !self.click_through;
                             window.set_cursor_hittest(!self.click_through);
@@ -281,6 +309,10 @@ struct RendererState {
     side_fraction: f32,
     width_scale: f32,
     blend: wgpu::BlendState,
+    #[cfg(all(windows, feature = "wgcapture"))]
+    background: Option<BackgroundRenderer>,
+    #[cfg(all(windows, feature = "wgcapture"))]
+    wgc: WgcCapture,
 }
 
 #[repr(C)]
@@ -616,6 +648,8 @@ impl RendererState {
         let audio_history = VecDeque::with_capacity(MAX_AUDIO_SAMPLES);
         let spectrum_bins = vec![0.0; INITIAL_SPECTRUM_BINS];
         let spectrum_renderer = SpectrumRenderer::new(&device, config.format, INITIAL_SPECTRUM_BINS, blend);
+        #[cfg(all(windows, feature = "wgcapture"))]
+        let background = Some(BackgroundRenderer::new(&device, config.format));
 
         Ok(Self {
             surface,
@@ -642,6 +676,10 @@ impl RendererState {
             side_fraction: DEFAULT_SIDE_FRACTION,
             width_scale: DEFAULT_WIDTH_SCALE,
             blend,
+            #[cfg(all(windows, feature = "wgcapture"))]
+            background,
+            #[cfg(all(windows, feature = "wgcapture"))]
+            wgc: WgcCapture::new(),
         })
     }
 
@@ -674,12 +712,7 @@ impl RendererState {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.0,
-                            g: 0.0,
-                            b: 0.0,
-                            a: 0.0,
-                        }),
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -687,6 +720,15 @@ impl RendererState {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
+            // Draw captured desktop background first (if any). If no new frame arrives,
+            // continue drawing the last uploaded texture to avoid flicker.
+            #[cfg(all(windows, feature = "wgcapture"))]
+            if let Some(bg) = self.background.as_mut() {
+                if let Some((w, h, bytes)) = self.wgc.frame_bgra() {
+                    bg.upload(&self.device, &self.queue, w, h, bytes);
+                }
+                bg.draw(&mut pass);
+            }
             self.spectrum_renderer.draw(&mut pass);
         }
 
@@ -789,3 +831,153 @@ impl RendererState {
         }
     }
 }
+
+#[cfg(all(windows, feature = "wgcapture"))]
+struct BackgroundRenderer {
+    pipeline: wgpu::RenderPipeline,
+    bind_layout: wgpu::BindGroupLayout,
+    bind_group: wgpu::BindGroup,
+    sampler: wgpu::Sampler,
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    size: (u32, u32),
+}
+
+#[cfg(all(windows, feature = "wgcapture"))]
+impl BackgroundRenderer {
+    fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Aurion BG Sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
+        let bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Aurion BG BindLayout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Aurion BG PipelineLayout"),
+            bind_group_layouts: &[&bind_layout],
+            push_constant_ranges: &[],
+        });
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Aurion BG Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/quad.wgsl").into()),
+        });
+
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Aurion BG Pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        // Start with a 1x1 transparent texture
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Aurion BG Texture"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Bgra8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Aurion BG BindGroup"),
+            layout: &bind_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
+            ],
+        });
+
+        Self { pipeline, bind_layout, bind_group, sampler, texture, view, size: (1, 1) }
+    }
+
+    fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, w: u32, h: u32, bgra: &[u8]) {
+        if (w, h) != self.size {
+            self.texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Aurion BG Texture"),
+                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Bgra8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            self.view = self.texture.create_view(&wgpu::TextureViewDescriptor::default());
+            self.bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Aurion BG BindGroup"),
+                layout: &self.bind_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&self.view) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                ],
+            });
+            self.size = (w, h);
+        }
+
+        let bytes_per_row = 4 * w;
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &self.texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            bgra,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bytes_per_row), rows_per_image: Some(h) },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+    }
+
+    fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.draw(0..3, 0..1);
+    }
+}
+
