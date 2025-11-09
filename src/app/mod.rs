@@ -118,24 +118,28 @@ impl ApplicationHandler for AurionApp {
                     match &event.logical_key {
                         #[cfg(all(windows, feature = "wgcapture"))]
                         Key::Named(NamedKey::F1) => {
+                            println!("Switching to foreground window capture");
                             if let Some(state) = self.state.as_mut() {
                                 state.wgc.set_source(WgcSource::ForegroundWindow);
                             }
                         }
                         #[cfg(all(windows, feature = "wgcapture"))]
                         Key::Named(NamedKey::F2) => {
+                            println!("Switching to next monitor");
                             if let Some(state) = self.state.as_mut() {
                                 state.wgc.next_monitor();
                             }
                         }
                         #[cfg(all(windows, feature = "wgcapture"))]
                         Key::Named(NamedKey::F3) => {
+                            println!("Switching to previous monitor");
                             if let Some(state) = self.state.as_mut() {
                                 state.wgc.prev_monitor();
                             }
                         }
                         #[cfg(all(windows, feature = "wgcapture"))]
                         Key::Named(NamedKey::F4) => {
+                            println!("Switching to monitor capture");
                             if let Some(state) = self.state.as_mut() {
                                 state.wgc.set_source(WgcSource::None);
                             }
@@ -845,7 +849,7 @@ struct BackgroundRenderer {
 
 #[cfg(all(windows, feature = "wgcapture"))]
 impl BackgroundRenderer {
-    fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
+     fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("Aurion BG Sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -916,14 +920,14 @@ impl BackgroundRenderer {
             cache: None,
         });
 
-        // Start with a 1x1 transparent texture
+        // Start with a 1x1 *sRGB* texture
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Aurion BG Texture"),
             size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Bgra8Unorm,
+            format: wgpu::TextureFormat::Bgra8UnormSrgb, // <— sRGB
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -943,13 +947,14 @@ impl BackgroundRenderer {
 
     fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, w: u32, h: u32, bgra: &[u8]) {
         if (w, h) != self.size {
+            // Recreate as *sRGB* when the size changes
             self.texture = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("Aurion BG Texture"),
                 size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Bgra8Unorm,
+                format: wgpu::TextureFormat::Bgra8UnormSrgb, // <— sRGB
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             });
@@ -967,9 +972,18 @@ impl BackgroundRenderer {
 
         let bytes_per_row = 4 * w;
         queue.write_texture(
-            wgpu::TexelCopyTextureInfo { texture: &self.texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All
+            },
             bgra,
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bytes_per_row), rows_per_image: Some(h) },
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bytes_per_row),
+                rows_per_image: Some(h)
+            },
             wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
         );
     }
